@@ -8,7 +8,7 @@ Description: A web application framework written in Python.
 Usage: Used the python http.server module to create a simple webserver.  
 
 ## Express
-Description: A minimal and flexible Node.js web application framework that provides a robust set of features for web and mobile applications.
+Description: A minimal and flexible Node.js web application framework that provides a robust set of features for web and mobile applications.  
 Usage: Handle the HTTP requests and response.  
 
 ## GraphQL
