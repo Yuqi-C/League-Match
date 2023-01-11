@@ -1,0 +1,833 @@
+const express = require('express');
+const { graphqlHTTP } = require('express-graphql');
+const DataLoader = require('dataloader');
+
+const { assertResolversPresent, makeExecutableSchema } = require('@graphql-tools/schema');
+const { MongoClient, ObjectId } = require('mongodb');
+const { exit } = require("process");
+const fs = require('fs');
+var cors = require('cors');
+
+const port = 3000;
+
+class PlayerSourceJson{
+    
+    async getPlayer(pid){
+        const player = await client.db(dbName).collection("player").findOne({_id: ObjectId(pid)});
+        if(player === null) return null;
+        const playerInfo = {
+            balance_usd_cents:     player.balance_usd_cents,
+            efficiency:            0,
+            fname:                 player.fname,
+            handed:                player.handed,
+            in_active_match:       null,
+            is_active:             player.is_active,
+            lname:                 player.lname,
+            name:                  player.fname,
+            num_dq:                0,
+            num_join:              0,
+            num_won:               0,
+            pid:                   pid,
+            total_points:          0,
+            total_prize_usd_cents: 0
+        };
+        if(player.lname != '') playerInfo.name = player.fname + ' ' + player.lname;
+        if(player.handed === 'L'){
+            playerInfo.handed = 'left';
+        }else if(player.handed === 'R'){
+            playerInfo.handed = 'right';
+        }else{
+            playerInfo.handed = 'ambi';
+        }
+        const matches = await client.db(dbName).collection("match").find({$or:[{p1_id: Object(pid)}, {p2_id: Object(pid)}]}).toArray();
+        for(const match of matches){
+            playerInfo.num_join++;
+            const matchInfo = await this.getMatch(match._id.toString());
+            if(matchInfo.winner_pid === pid){ // won
+                playerInfo.num_won++;
+                playerInfo.total_prize_usd_cents += matchInfo.prize_usd_cents;
+            }else if(matchInfo.winner_pid === null){ // active match
+                playerInfo.in_active_match = matchInfo;
+            }else{ // another player won
+                if(matchInfo.is_dq === true) playerInfo.num_dq++;
+            }
+            if(match.p1_id === pid){
+                playerInfo.total_points += matchInfo.p1_points;
+            }else{
+                playerInfo.total_points += matchInfo.p2_points;
+            }
+        }
+        if(playerInfo.num_join != 0){
+            playerInfo.efficiency = playerInfo.num_won / playerInfo.num_join;
+        }
+        return playerInfo;
+    }
+
+    async getPlayers(){
+        // Find all active players
+        const arr = []
+
+        const players = await client.db(dbName).collection("player").find({}).toArray();
+
+        for(const player of players){
+            const playerInfo = await this.getPlayer(player._id.toString());
+            arr.push(playerInfo);
+        }
+        arr.sort((a, b) => {
+            return a.name.localeCompare(b.name);
+        });
+        return arr;
+    }
+
+    checkPostPlayer(query){
+        const inval = [];
+        let fname, handed, balance;
+        let lname = '';
+
+        // check first name
+        if("fname" in query){
+            fname = query.fname;
+            if(fname !== ''){
+                for(let ch of fname.toLowerCase()){
+                    if(!(ch >= 'a' && ch <= 'z')){
+                        inval.push("fname");
+                    }
+                }
+            }else{
+                inval.push("fname");
+            }    
+        }else{
+            inval.push("fname");
+        }
+
+        // check last name
+        if("lname" in query){
+            lname = query.lname;
+            for(let ch of lname.toLowerCase()){
+                if(!(ch >= 'a' && ch <= 'z')){
+                    inval.push("lname");
+                }
+            }
+        }   
+
+        // check handed 
+        if("handed" in query){
+            handed = query.handed.toLowerCase();
+            if(!(handed === "left" || handed === "right" || handed === "ambi")){
+                inval.push("handed");
+            }
+        }else{
+            inval.push("handed");
+        }
+
+        balance = Number(query.initial_balance_usd_cents);
+        if((!Number.isInteger(balance)) || balance < 0){
+            inval.push("initial_balance_usd_cents");
+        }
+
+        // Response Failure
+        if(inval.length !== 0){
+            let body = "invalid fields: ";
+            for(let idx in inval){
+                body += inval[idx];
+                if(idx != inval.length){
+                    body += ',';
+                }
+            }
+            return body;
+        }
+        return null;
+    }
+
+    async postPlayer(query){
+        // success
+        const playerInfo = {
+            _id: ObjectId(),
+            fname: query.fname,
+            lname: '',
+            handed: query.handed.toUpperCase()[0],
+            is_active: true,
+            balance_usd_cents: Number(query.initial_balance_usd_cents),
+            created_at: new Date()
+        };
+        if("lname" in query) playerInfo.lname = query.lname;
+        await client.db(dbName).collection('player').insertOne(playerInfo);
+        return playerInfo._id;
+    }
+
+    async updatePlayer(pid, query){
+
+        const updateObj = {};
+
+        if("lname" in query){
+            let lname = query.lname;
+            for(let ch of lname.toLowerCase()){
+                if(!(ch >= 'a' && ch <= 'z')){
+                    return false;
+                }
+            }
+            updateObj.lname = lname;
+        }    
+        // check if active valid
+        if("is_active" in query){
+            updateObj.is_active = query.is_active;
+        }
+ 
+        // Update
+        var newvalues = {$set: updateObj};
+        const result = await client.db(dbName).collection("player").updateOne({_id: ObjectId(pid)}, newvalues);
+        return (result.modifiedCount > 0)? true : false;
+    }
+
+    async updateBalance(pid, balance){
+        // invalid balance
+        if(!Number.isInteger(balance) || balance < 0){
+            return null;
+        }
+    
+        const search = {_id: ObjectId(pid)};
+        // Find old_balance
+        const player = await client.db(dbName).collection("player").findOne(search)
+        if(player === null){
+            return null;
+        }
+        var old_balance = player.balance_usd_cents;
+            
+        // Update balance
+        var new_balance = balance + old_balance;
+        var newValues = {$set: {balance_usd_cents: new_balance}};
+        await client.db(dbName).collection("player").updateOne(search, newValues);
+        player.balance_usd_cents = new_balance;
+        return player;
+    }
+
+    async deletePlayer(pid){
+        const result = await client.db(dbName).collection("player").deleteOne({_id: ObjectId(pid)});
+        return (result.deletedCount === 1)? true : false;
+    }
+
+    async getMatch(mid){
+        const event = new Date();
+        const match = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+
+        const p1 = await source.getPlayer(match.p1_id.toString());
+        const p2 = await source.getPlayer(match.p2_id.toString());
+        const matchInfo = {
+            age:                 Math.trunc(Math.abs(event.getTime() - match.created_at.getTime()) / 1000),
+            ended_at:            null,
+            entry_fee_usd_cents: match.entry_fee_usd_cents,
+            is_active:           true,
+            is_dq:               false,
+            mid:                 match._id.toString(),
+            p1:                  p1,
+            p1_points:           0,
+            p2:                  p2,
+            p2_points:           0,
+            prize_usd_cents:     match.prize_usd_cents,
+            winner:              null
+        }
+
+        if("ended_at" in match){
+            matchInfo.ended_at = match.ended_at;
+        }
+        if("is_dq" in match){
+            matchInfo.is_dq = match.is_dq;
+        }
+        if("p1_points" in match){
+            matchInfo.p1_points = match.p1_points;
+        }
+        if("p2_points" in match){
+            matchInfo.p2_points = match.p2_points;
+        }
+        if(matchInfo.ended_at !== null){
+            matchInfo.winner_pid = (match.p1_points > match.p2_points)? match.p1_id.toString() : match.p2_id.toString(); 
+            matchInfo.is_active = false;
+            matchInfo.age = Math.trunc(Math.abs(match.ended_at.getTime() - match.created_at.getTime()) / 1000);
+        }
+        return matchInfo;
+    }
+
+    async getMatches(){
+        const arr = [];
+        const inactive = []
+        const options = {
+            sort: {prize_usd_cents: -1}
+        }
+        const matches = await client.db(dbName).collection("match").find({}, options).toArray();
+        for(const match of matches){
+            const matchInfo = await this.getMatch(match._id.toString());
+            if(matchInfo.ended_at === null){
+                arr.push(matchInfo);
+            }else{
+                matchInfo.winner_pid = (match.p1_points > match.p2_points)? match.p1_id : match.p2_id; 
+                matchInfo.is_active = false;
+                matchInfo.age = Math.abs(match.ended_at.getTime() - match.created_at.getTime()) / 1000;
+                inactive.push(matchInfo);
+            }
+        }
+        inactive.sort((a, b) => {
+            return a.ended_at < b.ended_at;
+        });
+
+        var count = 0;
+        for(const match of inactive){
+            arr.push(match);
+            count++;
+            if(count >= 4) break;
+        }
+        return arr;
+    }
+
+    async postMatch(pid1, pid2, entry_fee, prize){
+        const player1 = await client.db(dbName).collection("player").findOne({_id: ObjectId(pid1)});
+        const player2 = await client.db(dbName).collection("player").findOne({_id: ObjectId(pid2)});
+
+        // Player1 or player2 not exist
+        if(player1 === null || player2 === null){
+            return null;
+        }
+    
+        // Player1 or player2 already in an active match
+        if(player1.is_active === false || player2.is_active === false){
+            return null;
+        }
+
+        // invalid entry_fee or prize
+        if(entry_fee < 0 || prize < 0){
+            return null;
+        }
+
+        // insufficient account balance
+        if(player1.balance_usd_cents < entry_fee || player2.balance_usd_cents < entry_fee){
+            return null;
+        }
+
+        // Success
+        // update player
+        var newValues1 = {$set: {balance_usd_cents: player1.balance_usd_cents - entry_fee, is_active: false}};
+        await client.db(dbName).collection("player").updateOne({_id: player1._id}, newValues1);
+        var newValues2 = {$set: {balance_usd_cents: player2.balance_usd_cents - entry_fee, is_active: false}};
+        await client.db(dbName).collection("player").updateOne({_id: player2._id}, newValues2);
+
+        // create match
+        const matchInfo = {
+            _id: ObjectId(),
+            created_at: new Date(),
+            entry_fee_usd_cents: entry_fee, 
+            p1_id: player1._id,
+            p2_id: player2._id,
+            prize_usd_cents: prize
+        };
+        await client.db(dbName).collection('match').insertOne(matchInfo); 
+        const match = await this.getMatch(matchInfo._id.toString());
+        return match;
+    }
+
+    async updatePoints(mid, pid, points){
+        // invalid points
+        if(points <= 0){
+            return null;
+        }
+
+        // invalid objectId
+        if(!mid.match(/^[0-9a-fA-F]{24}$/) || !pid.match(/^[0-9a-fA-F]{24}$/)){
+            return null;
+        }
+        const match = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+        const player = await client.db(dbName).collection("player").findOne({_id: ObjectId(pid)});
+
+        // player or match does not exist
+        if(match === null || player === null){
+            return null;
+        }
+
+        // player not exist in the match
+        if(match.p1_id.toString() !== pid && match.p2_id.toString() !== pid){
+            return null;
+        }
+
+        // match not active
+        if(("ended_at" in match) && match.ended_at !== null){
+            return null;
+        }
+
+        // in case points not exist in match
+        var points1 = ("p1_points" in match)? match.p1_points : 0;
+        var points2 = ("p2_points" in match)? match.p2_points : 0;
+
+        // success
+        const updateObj = {};
+        if(pid === match.p1_id.toString()){
+            updateObj.p1_points = points1 + points;  
+        }else{
+            updateObj.p2_points = points2 + points;
+        }
+        var newvalues = {$set: updateObj};
+        await client.db(dbName).collection("match").updateOne({_id: ObjectId(mid)}, newvalues);
+
+        // return value
+        const matchInfo = this.getMatch(mid);
+        return matchInfo;
+    }
+
+    async endGame(mid){
+        // invalid objectId(mid)
+        if(!mid.match(/^[0-9a-fA-F]{24}$/)){
+            return null;
+        }
+        const match = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+        // match not exists
+        if(match === null){
+            return null;
+        }
+
+        var points1 = ("p1_points" in match)? updatedMatch.p1_points : 0;
+        var points2 = ("p2_points" in match)? updatedMatch.p2_points : 0;
+
+        // match inactive or tie
+        if((("ended_at" in match) && (match.ended_at !== null)) || (points1 === points2)){
+            return null;
+        }
+
+        // Success
+        // end game
+        var newvalues = {$set: {ended_at: new Date()}};
+        await client.db(dbName).collection("match").updateOne({_id: ObjectId(mid)}, newvalues);
+        const updatedMatch = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+        
+        // update winner
+        var winner = (points1 > points2)? updatedMatch.p1_id : updatedMatch.p2_id;
+        const player = await client.db(dbName).collection("player").findOne({_id: winner});
+        const newValue = {$set: {balance_usd_cents: player.balance_usd_cents + updatedMatch.prize_usd_cents}}
+        await client.db(dbName).collection("player").updateOne({_id: winner}, newValue);
+
+        // update status of players
+        await client.db(dbName).collection("player").updateOne({_id: updatedMatch.p1_id}, {$set: {is_active: true}});
+        await client.db(dbName).collection("player").updateOne({_id: updatedMatch.p2_id}, {$set: {is_active: true}});
+
+        // update match
+        const matchInfo = await this.getMatch(mid);
+        return matchInfo;
+    }
+
+    async disqualify(mid, pid){
+
+        // invalid objectId
+        if(!mid.match(/^[0-9a-fA-F]{24}$/) || !pid.match(/^[0-9a-fA-F]{24}$/)){
+            return null;
+        }
+
+        const match = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+        const disq_player = await client.db(dbName).collection("player").findOne({_id: ObjectId(pid)});
+
+        // player or match does not exist
+        if(match === null || disq_player === null){
+            return null;
+        }
+
+        // player not exists in match
+        if(match.p1_id.toString() !== pid && match.p2_id.toString() !== pid){
+            return null;
+        }
+
+        // match not active
+        if( ("ended_at" in match) && match.ended_at !== null){
+            return null;
+        }
+
+        // success
+        // update match
+        const updateObj = {
+            ended_at: new Date(),
+            is_dq: true
+        }
+        var newvalues = {$set: updateObj};
+        await client.db(dbName).collection("match").updateOne({_id: ObjectId(mid)}, newvalues);
+
+        // update players status
+        await client.db(dbName).collection("player").updateOne({_id: match.p1_id}, {$set: {is_active: true}});
+        await client.db(dbName).collection("player").updateOne({_id: match.p2_id}, {$set: {is_active: true}});
+
+        const updatedMatch = await client.db(dbName).collection("match").findOne({_id: ObjectId(mid)});
+        
+        // update winner balance
+        var winner = (updatedMatch.p1_id.toString() === pid)? updatedMatch.p2_id : updatedMatch.p1_id;
+        const player = await client.db(dbName).collection("player").findOne({_id: winner});
+        const newValue = {$set: {balance_usd_cents: player.balance_usd_cents + updatedMatch.prize_usd_cents}};
+        await client.db(dbName).collection("player").updateOne({_id: winner}, newValue);
+    
+        // update match
+        const matchInfo = await this.getMatch(mid);
+        return matchInfo;
+    }
+}
+
+const typeDefs = `
+    type Query {
+        player(pid: ID!): Player
+
+        players(
+        limit:  Int
+        offset: Int
+        sort:   String 
+        ): [Player]!
+
+        match(mid:    ID!): Match
+
+        matches(
+        limit:  Int
+        offset: Int
+        sort:   String 
+        ): [Match]!
+    }
+
+    type Mutation {
+        matchAward(
+        mid:    ID!
+        pid:    ID!
+        points: Int!
+        ): Match
+
+        matchCreate(
+        pid1:                ID!
+        pid2:                ID!
+        entry_fee_usd_cents: Int!
+        prize_usd_cents:     Int!
+        ): Match
+
+        matchDisqualify(
+        mid: ID!
+        pid: ID!
+        ): Match
+
+        matchEnd(
+        mid: ID!
+        ): Match
+
+        playerCreate(
+        playerInput: PlayerCreateInput
+        ): Player
+
+        playerDelete(pid: ID!): Boolean
+
+        playerDeposit(
+        pid:              ID!
+        amount_usd_cents: Int!
+        ): Player
+
+        playerUpdate(
+        pid:         ID!
+        playerInput: PlayerUpdateInput
+        ): Player
+    }
+
+    enum HandedEnum {
+        ambi
+        left
+        right
+    }
+
+    input PlayerCreateInput {
+        fname:                     String!
+        handed:                    HandedEnum
+        initial_balance_usd_cents: Int!
+        lname:                     String
+    }
+
+    input PlayerUpdateInput {
+        is_active: Boolean
+        lname:     String
+    }
+
+    type Player {
+        balance_usd_cents:     Int
+        efficiency:            Float
+        fname:                 String
+        handed:                HandedEnum
+        in_active_match:       Match
+        is_active:             Boolean
+        lname:                 String
+        name:                  String
+        num_dq:                Int
+        num_join:              Int
+        num_won:               Int
+        pid:                   ID!
+        total_points:          Int
+        total_prize_usd_cents: Int
+    }
+
+    type Match {
+        age:                 Int
+        ended_at:            String
+        entry_fee_usd_cents: Int
+        is_active:           Boolean
+        is_dq:               Boolean
+        mid:                 ID!
+        p1:                  Player!
+        p1_points:           Int
+        p2:                  Player!
+        p2_points:           Int
+        prize_usd_cents:     Int
+        winner:              Player
+    }
+`
+const app = express();
+const source = new PlayerSourceJson();
+const env = {
+    host: "localhost",
+    port: "27017",
+    db: "ee547_hw",
+    opts: {
+        useUnifiedTopology: true
+    }
+}
+const dbName = env.db;
+const uri = `mongodb://${env.host}:${env.port}`;
+const client = new MongoClient(uri, env.opts); 
+
+app.use(cors({
+    origin: '*'
+}));
+
+(async function () {
+    
+    await client.connect();
+
+    // client.db(dbName).collection("match").deleteMany({});
+    // client.db(dbName).collection("player").deleteMany({});
+  
+    const resolvers = {
+
+        Query: {
+            player: (_, {pid}, context) => {
+                return context.loaders.player.load(pid);
+            },
+            players: async (_, { limit = 20, offset = 0, sort = null }, context) => {
+                const players = await source.getPlayers();
+                return players.map(({ pid }) => context.loaders.player.load(pid));
+            },
+            match: (_, {mid}, context) => {
+                return context.loaders.match.load(mid);
+            },
+            matches: async (_, { limit = 20, offset = 0, sort = null }, context) => {
+                const matches = await source.getMatches();
+                return matches.map(({ mid }) => context.loaders.match.load(mid));
+            }
+        },
+
+        Mutation: {
+            
+            // Mutation -- match
+
+            matchAward: async (_, { mid, pid, points }, context) => {
+                const res = await source.updatePoints(mid, pid, points);
+
+                if(res == null) return null;
+
+                // Clear cache
+                await context.loaders.player.clear(pid);
+                await context.loaders.match.clear(mid);
+                return context.loaders.match.load(mid);
+            },
+
+            matchCreate: async(_, {pid1, pid2, entry_fee_usd_cents, prize_usd_cents}, context) => {
+                const match = await source.postMatch(pid1, pid2, entry_fee_usd_cents, prize_usd_cents);
+                
+                if(match == null) return null;
+                
+                // Clear cache
+                await context.loaders.player.clear(pid1);
+                await context.loaders.player.clear(pid2);
+                return context.loaders.match.load(match.mid);
+            },
+            
+            matchDisqualify: async (_, {mid, pid}, context) => {
+                const match = await source.disqualify(mid, pid);
+                
+                if(match == null) return null;
+                
+                // Clear cache
+                await context.loaders.player.clear(match.p1.pid);
+                await context.loaders.player.clear(match.p2.pid);                
+                await context.loaders.match.clear(mid);
+                return context.loaders.match.load(mid);
+            },
+            
+            matchEnd: async (_, {mid}, context) => {
+                const match = await source.endGame(mid);
+
+                if(match == null) return null;
+
+                // Clear cache
+                await context.loaders.player.clear(match.p1.pid);
+                await context.loaders.player.clear(match.p2.pid);                
+                await context.loaders.match.clear(mid);
+                return context.loaders.match.load(mid);     
+            },
+
+            // Mutation -- Player
+
+            playerCreate: async (_, {playerInput}, context) => {
+                const invalid = source.checkPostPlayer(playerInput);
+                if(invalid !== null) return null;
+                const id = await source.postPlayer(playerInput);     
+                
+                return await context.loaders.player.load(id.toString());     
+            },
+
+            playerDelete: async (_, {pid}, context) => {
+                const flag = await source.deletePlayer(pid);
+                await context.loaders.player.clear(pid);
+                return flag;
+            },
+
+            playerDeposit: async (_, {pid, amount_usd_cents}, context) => {
+                const player = await source.updateBalance(pid, amount_usd_cents);
+                if(player == null) return null;
+                await context.loaders.player.clear(pid);
+                return context.loaders.player.load(pid);   
+            },
+            
+            playerUpdate: async (_, {pid, playerInput}, context) =>{
+                const flag = await source.updatePlayer(pid, playerInput);
+                if(!flag) return null;
+                await context.loaders.player.clear(pid);
+                return context.loaders.player.load(pid);   
+            }
+
+        },
+
+        Player: {
+            balance_usd_cents: ({ balance_usd_cents }, _, context) => {
+                return balance_usd_cents;
+            },
+            efficiency:({ efficiency }, _, context) => {
+                return efficiency;
+            },
+            fname: ({ fname }, _, context) => {
+                return fname;
+            },        
+            handed:  ({ handed }, _, context) => {
+                return handed;
+            },  
+            in_active_match: ({ in_active_match }, _, context) => {
+                return in_active_match;
+            }, 
+            is_active:  ({ is_active }, _, context) => {
+                return is_active;
+            },      
+            lname:  ({ lname }, _, context) => {
+                return lname;
+            },    
+            name:  ({ name }, _, context) => {
+                return name;
+            },                 
+            num_dq:  ({ num_dq }, _, context) => {
+                return num_dq;
+            },  
+            num_join:  ({ num_join }, _, context) => {
+                return num_join;
+            },  
+            num_won:  ({ num_won }, _, context) => {
+                return num_won;
+            },       
+            pid:  ({ pid }, _, context) => {
+                return pid;
+            },           
+            total_points:  ({ total_points }, _, context) => {
+                return total_points;
+            },    
+            total_prize_usd_cents: ({ total_prize_usd_cents }, _, context) => {
+                return total_prize_usd_cents;
+            }
+        },
+
+        Match: {
+            age: ({ age }, _, context) => {
+                return age;
+            },
+            ended_at: ({ ended_at }, _, context) => {
+                return ended_at;
+            },
+            entry_fee_usd_cents: ({ entry_fee_usd_cents }, _, context) => {
+                return entry_fee_usd_cents;
+            },
+            is_active: ({ is_active }, _, context) => {
+                return is_active;
+            },
+            is_dq: ({ is_dq }, _, context) => {
+                return is_dq;
+            },
+            mid: ({ mid }, _, context) => {
+                return mid;
+            },
+            p1: ({ p1 }, _, context) => {
+                return p1;
+            },
+            p1_points: ({ p1_points }, _, context) => {
+                return p1_points;
+            },
+            p2: ({ p2 }, _, context) => {
+                return p2;
+            },
+            p2_points: ({ p2_points }, _, context) => {
+                return p2_points;
+            },
+            prize_usd_cents: ({ prize_usd_cents }, _, context) => {
+                return prize_usd_cents;
+            },
+            winner: ({ winner }, _, context) => {
+                return winner;
+            }
+        }
+    }
+
+    const schema = makeExecutableSchema({
+      resolvers,
+      resolverValidationOptions: {
+        requireResolversForAllFields:  'warn',
+        requireResolversToMatchSchema: 'warn'
+      },
+      typeDefs
+    });
+  
+    // Get
+    app.get('/ping', (req, res) => {
+        res.status(204).json([]);
+    })
+
+    app.use('/graphql', graphqlHTTP(async (req) => {
+        return {
+            schema,
+            graphiql: true,
+            context: {
+                db: client.db(dbName),
+                loaders: {
+                    player:    new DataLoader(keys => loadPlayers(keys)),
+                    match:     new DataLoader(keys => loadMatches(keys)),
+                }
+            }
+        };
+    }));
+  
+    app.listen(port);
+
+})()
+
+async function loadPlayers(keys) {
+    const players = await source.getPlayers();
+    const results = players.reduce((acc, player) => {
+        acc[player.pid] = player;
+        return acc;
+    }, {});
+    return keys.map(key => results[key] || new Error(`user [${key}] does not exist `));
+}
+
+async function loadMatches(keys) {
+    const matches = await source.getMatches();
+    const results = matches.reduce((acc, match) => {
+        acc[match.mid] = match;
+        return acc;
+    }, {});
+    return keys.map(key => results[key] || new Error(`user [${key}] does not exist `));
+}
